@@ -1,46 +1,46 @@
-# Tiny Tapeout project information
+# Tiny Tapeout project information (yaml_version 6, from ttsky-verilog-template)
 project:
-  title:        ""      # Project title
-  author:       ""      # Your name
-  discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  ""      # One line description of what your project does
-  language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
+  title:        "Accelerometer Interface (H3LIS331DL)"
+  author:       "Sai Kumar Poludasu"
+  discord:      ""
+  description:  "SPI master for an H3LIS331DL accelerometer, CIC decimator, FIFO and SPI slave host port"
+  language:     "Verilog"
+  clock_hz:     10000000
 
-  # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  # Estimate from generic synthesis (983 flip-flops). Confirm with the GDS
+  # hardening run before submitting; 1x2 may fit with an 4-deep FIFO.
+  tiles: "2x2"
 
-  # Your top module name must start with "tt_um_". Make it unique by including your github username:
-  top_module:  "tt_um_example"
+  top_module:  "tt_um_saikumarpv2643_accel_if"
 
-  # List your project's source files here.
-  # Source files must be in ./src and you must list each source file separately, one per line.
-  # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
     - "project.v"
+    - "spi_master.v"
+    - "sensor_ctrl.v"
+    - "cic_decim.v"
+    - "sync_fifo.v"
+    - "host_if.v"
 
-# The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
-# This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
+  ui[0]: "SENS_MISO"
+  ui[1]: "SENS_DRDY"
+  ui[2]: "HOST_SCK"
+  ui[3]: "HOST_MOSI"
+  ui[4]: "HOST_CS_N"
   ui[5]: ""
   ui[6]: ""
   ui[7]: ""
 
   # Outputs
-  uo[0]: ""
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  uo[0]: "SENS_SCK"
+  uo[1]: "SENS_MOSI"
+  uo[2]: "SENS_CS_N"
+  uo[3]: "HOST_MISO"
+  uo[4]: "IRQ"
+  uo[5]: "SENSOR_OK"
+  uo[6]: "OVERFLOW"
+  uo[7]: "RUNNING"
 
   # Bidirectional pins
   uio[0]: ""
@@ -52,5 +52,4 @@ pinout:
   uio[6]: ""
   uio[7]: ""
 
-# Do not change!
 yaml_version: 6
