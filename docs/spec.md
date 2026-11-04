@@ -136,10 +136,12 @@ FIFO depth: parameter, 8 on Tiny Tapeout, 32–64 on a whole die.
 - LEVEL and STATUS seen by the host can be a few records stale (never more
   records than really present).
 - Boot retries until both sensors answer, in every mode.
-- Size (generic Yosys): 6557 cells, 1402 flip-flops/latches (FIFO 640). Likely
+- Size (generic Yosys): 6560 cells, 1402 flip-flops/latches (FIFO 640). Likely
   more than 2x2 Tiny Tapeout tiles: hardening will tell; FIFO_AW=2 halves the FIFO.
 - Gating measured in simulation: SPI master clocked 34.6 % of cycles,
-  datapath 0.6 %.
+  datapath 0.7 % (nobody reading, so the FIFO is full and dropping records).
+- Any signal on a gated clock that must return to 0 has to hold its clock gate
+  open until it does. `drop` missed this once (fixed 2026-11-04): see README.
 
 ## 11. Open questions
 

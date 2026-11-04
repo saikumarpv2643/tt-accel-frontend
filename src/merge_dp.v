@@ -40,7 +40,10 @@ module merge_dp (
     reg [1:0]  k;
     reg        run, gap, use_h;
 
-    assign busy = run || wr;
+    // Keeps the clock gate open until wr and drop have returned to 0. Without
+    // drop here, the gate closed with drop still high, and it stayed high until
+    // the next sample. That blocked the host's overflow clear in project.v.
+    assign busy = run || wr || drop;
 
     function [15:0] pick(input [47:0] v, input [1:0] p);
         pick = (p == 2'd0) ? v[15:0] : (p == 2'd1) ? v[31:16] : v[47:32];

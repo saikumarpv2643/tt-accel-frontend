@@ -154,9 +154,17 @@ async def test_overflow_gap_and_irq(dut):
     await with_timeout(RisingEdge(dut.irq), 10_000_000, "ns")
     assert (await b.host.read(0x03))[0] >= 4
     await Timer(15, "ms")
-    st = (await b.host.read(0x02))[0]
-    assert st & 0b0100, "overflow set"
-    assert not (await b.host.read(0x02))[0] & 0b0100 or True
+    # Read straight after a drop. The next drop is about 1 ms away, so the flag
+    # must clear within the 20 us that lets the clear toggle reach the core.
+    # Regression: drop once stayed high behind the closed clock gate and blocked
+    # this clear until the next sample.
+    await RisingEdge(dut.user_project.drop)
+    await Timer(100, "us")
+    assert (await b.host.read(0x02))[0] & 0b0100, "overflow stays set after the drop"
+    await RisingEdge(dut.user_project.drop)
+    assert (await b.host.read(0x02))[0] & 0b0100, "overflow set"
+    await Timer(20, "us")
+    assert not (await b.host.read(0x02))[0] & 0b0100, "overflow clears on read"
     recs = await b.host.records(8)
     assert not any(r["gap"] for r in recs)
     await Timer(3, "ms")
@@ -231,11 +239,17 @@ def band_signal(t):
 
 @cocotb.test(skip=GL)
 async def test_hysteresis_band(dut):
-    b = await setup(dut, accel=band_signal)
+    # Sim time keeps running across tests, so the signal is timed from this
+    # test's start. Requiring records in each window stops the checks below
+    # from passing on an empty list.
+    t0 = cocotb.utils.get_sim_time("ns")
+    b = await setup(dut, accel=lambda t: band_signal(t - t0))
     await wait_running(dut)
     recs = await collect(dut, b.host, 75)
     ref = reference(b.log)
     assert [(r["axes"], r["src"]) for r in recs] == [x[:2] for x in ref[:len(recs)]]
-    xs = [(x[2] / 1e6, x[1] & 1) for x in ref[:len(recs)]]
+    xs = [((x[2] - t0) / 1e6, x[1] & 1) for x in ref[:len(recs)]]
+    assert sum(31 < t < 44 for t, _ in xs) >= 10, "too few records from below"
+    assert sum(51 < t < 64 for t, _ in xs) >= 10, "too few records from above"
     assert all(s == 0 for t, s in xs if 31 < t < 44), "in the band from below: low-g"
     assert all(s == 1 for t, s in xs if 51 < t < 64), "in the band from above: high-g"
