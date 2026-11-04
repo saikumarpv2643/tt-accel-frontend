@@ -1,104 +1,126 @@
-"""Behavioural models for the cocotb tests.
+"""Models for the v2 tests.
 
-H3LIS331DL  - SPI slave, mode 3, register file, data-ready on INT1, BDU.
-HostSPI     - SPI master, mode 0, driving the design's host interface.
-cic_ref     - bit-exact reference of the CIC decimator.
+Sensor     - SPI slave (mode 3) for an H3LIS331DL ('H') or IIS2DLPC ('L'),
+             with its own DRDY rate, block data update, and a log of every
+             sample read by the design, in bus order.
+HostSPI    - mode 0 master on its own clock, unrelated to the chip clock.
+reference  - bit-exact replay of merge_dp.v over the logged reads.
 """
-import random
+import math
 
-from cocotb.triggers import ClockCycles, FallingEdge, First, RisingEdge
+from cocotb.triggers import FallingEdge, First, RisingEdge, Timer
+from cocotb.utils import get_sim_time
 
-OUT_X_L = 0x28
-OUT_Z_H = 0x2D
+LSB_L = 0.001952    # g per 14-bit count, IIS2DLPC +-16 g
+LSB_H = 0.195       # g per 12-bit count, H3LIS331DL +-400 g
 
 
-class H3LIS331DL:
-    def __init__(self, dut, whoami=0x32, period=1000, seed=1):
-        self.dut = dut
-        self.whoami = whoami
-        self.period = period          # clock cycles between samples (ODR)
+def s16(v):
+    v &= 0xFFFF
+    return v - 0x10000 if v & 0x8000 else v
+
+
+class Sensor:
+    def __init__(self, dut, kind, period_ns, accel, bus_log, phase_ns=0):
+        self.dut, self.kind = dut, kind
+        self.cs = dut.cs_l_n if kind == "L" else dut.cs_h_n
+        self.miso = dut.miso_l if kind == "L" else dut.miso_h
+        self.drdy = dut.drdy_l if kind == "L" else dut.drdy_h
+        self.whoami = 0x44 if kind == "L" else 0x32
+        self.period_ns, self.phase_ns = period_ns, phase_ns
+        self.accel = accel            # f(t_ns) -> (gx, gy, gz)
+        self.bus_log = bus_log        # shared list of (kind, raw16 tuple, drdy_time_ns)
         self.regs = [0] * 0x40
-        self.regs[0x20] = 0x07        # CTRL_REG1 reset value: power-down
-        self.rng = random.Random(seed)
-        self.source = None            # optional callable -> (x, y, z) raw 16-bit
-        self.produced = []            # every sample made available, in order
-        self.overruns = 0             # samples overwritten before being read
-        self.pause = False
-        self.transactions = 0
-        dut.sens_miso.value = 0
-        dut.sens_drdy.value = 0
+        self.out_raw = (0, 0, 0)
+        self.out_time = 0
+        self.drdy_times = []
+        self.miso.value = 1
+        self.drdy.value = 0
 
-    def _read(self, addr):
-        return self.whoami if addr == 0x0F else self.regs[addr]
-
-    @property
     def active(self):
-        return (self.regs[0x20] >> 5) == 0b001   # normal power mode
+        if self.kind == "H":
+            return (self.regs[0x20] >> 5) == 1
+        return (self.regs[0x20] >> 4) != 0
+
+    def raw(self, t):
+        out = []
+        for a in self.accel(t):
+            if self.kind == "L":
+                c = max(-8192, min(8191, round(a / LSB_L)))
+                out.append((c << 2) & 0xFFFF)
+            else:
+                c = max(-2048, min(2047, round(a / LSB_H)))
+                out.append((c << 4) & 0xFFFF)
+        return tuple(out)
+
+    def _read(self, a):
+        if a == 0x0F:
+            return self.whoami
+        if 0x28 <= a <= 0x2D:
+            v = self.out_raw[(a - 0x28) // 2]
+            return (v >> 8) & 0xFF if (a - 0x28) % 2 else v & 0xFF
+        return self.regs[a]
 
     async def spi(self):
         dut = self.dut
         while True:
-            await FallingEdge(dut.sens_cs_n)
-            self.transactions += 1
-            nbits = cur = byte_idx = rw = ms = addr = out = 0
+            await FallingEdge(self.cs)
+            nbits = cur = idx = rw = ms = addr = out = 0
             while True:
-                await First(FallingEdge(dut.sens_sck), RisingEdge(dut.sens_cs_n))
-                if dut.sens_cs_n.value == 1:
+                await First(FallingEdge(dut.s_sck), RisingEdge(self.cs))
+                if self.cs.value == 1:
                     break
-                if byte_idx >= 1 and rw:
-                    dut.sens_miso.value = (out >> (7 - nbits)) & 1
-                await RisingEdge(dut.sens_sck)
-                cur = ((cur << 1) | int(dut.sens_mosi.value)) & 0xFF
+                if idx >= 1 and rw:
+                    self.miso.value = (out >> (7 - nbits)) & 1
+                await RisingEdge(dut.s_sck)
+                cur = ((cur << 1) | int(dut.s_mosi.value)) & 0xFF
                 nbits += 1
                 if nbits < 8:
                     continue
                 nbits = 0
-                if byte_idx == 0:
-                    rw, ms, addr = cur >> 7, (cur >> 6) & 1, cur & 0x3F
+                if idx == 0:
+                    rw = cur >> 7
+                    if self.kind == "H":
+                        ms, addr = (cur >> 6) & 1, cur & 0x3F
+                    else:                          # IIS2DLPC: auto-increment always
+                        ms, addr = 1, cur & 0x7F
                     if rw:
                         out = self._read(addr)
                 elif rw:
-                    if addr == OUT_Z_H:
-                        dut.sens_drdy.value = 0
+                    if addr == 0x2D:
+                        self.drdy.value = 0
+                        self.bus_log.append((self.kind, self.out_raw, self.out_time))
                     if ms:
-                        addr = (addr + 1) & 0x3F
-                    out = self._read(addr)
+                        addr += 1
+                    out = self._read(addr & 0x3F)
                 else:
-                    self.regs[addr] = cur
+                    self.regs[addr & 0x3F] = cur
                     if ms:
-                        addr = (addr + 1) & 0x3F
-                byte_idx += 1
-
-    def _next_sample(self):
-        if self.source is not None:
-            return self.source()
-        # 12-bit samples, left-justified in 16 bits as the sensor outputs them
-        return tuple(self.rng.randint(-2048, 2047) << 4 for _ in range(3))
+                        addr += 1
+                idx += 1
+            self.miso.value = 1
 
     async def producer(self):
-        dut = self.dut
+        if self.phase_ns:
+            await Timer(self.phase_ns, "ns")
+        t = self.phase_ns
         while True:
-            await ClockCycles(dut.clk, self.period)
-            if self.pause or not self.active:
+            await Timer(self.period_ns, "ns")
+            t += self.period_ns
+            if not self.active():
                 continue
-            # block data update: never change OUT registers mid-read
-            while dut.sens_cs_n.value == 0:
-                await RisingEdge(dut.sens_cs_n)
-            if dut.sens_drdy.value == 1:
-                self.overruns += 1
-            s = self._next_sample()
-            for i, v in enumerate(s):
-                u = v & 0xFFFF
-                self.regs[OUT_X_L + 2 * i] = u & 0xFF
-                self.regs[OUT_X_L + 2 * i + 1] = u >> 8
-            self.produced.append(s)
-            dut.sens_drdy.value = 1
+            while self.cs.value == 0:              # block data update
+                await RisingEdge(self.cs)
+            now = get_sim_time("ns")                 # absolute DRDY time
+            self.out_raw = self.raw(now)
+            self.out_time = now
+            self.drdy_times.append(now)
+            self.drdy.value = 1
 
 
 class HostSPI:
-    def __init__(self, dut, half=8):
-        self.dut = dut
-        self.half = half              # SCK half period in clock cycles
+    def __init__(self, dut, half_ns=137):
+        self.dut, self.half = dut, half_ns
         dut.host_sck.value = 0
         dut.host_mosi.value = 0
         dut.host_cs_n.value = 1
@@ -106,69 +128,88 @@ class HostSPI:
     async def xfer(self, data):
         dut, h = self.dut, self.half
         dut.host_cs_n.value = 0
-        await ClockCycles(dut.clk, h)
+        await Timer(h, "ns")
         rx = []
         for b in data:
             r = 0
             for i in range(8):
                 dut.host_mosi.value = (b >> (7 - i)) & 1
-                await ClockCycles(dut.clk, h)
+                await Timer(h, "ns")
                 dut.host_sck.value = 1
                 r = (r << 1) | int(dut.host_miso.value)
-                await ClockCycles(dut.clk, h)
+                await Timer(h, "ns")
                 dut.host_sck.value = 0
             rx.append(r)
-        await ClockCycles(dut.clk, h)
+        await Timer(h, "ns")
         dut.host_cs_n.value = 1
-        await ClockCycles(dut.clk, 2 * h)
+        await Timer(2 * h, "ns")
         return rx
 
     async def read(self, addr, n=1):
-        r = await self.xfer([0x80 | addr] + [0] * n)
-        return r[1:]
+        return (await self.xfer([0x80 | addr] + [0] * n))[1:]
 
-    async def write(self, addr, val):
-        await self.xfer([addr & 0x7F, val & 0xFF])
+    async def write(self, addr, *vals):
+        await self.xfer([addr & 0x7F] + [v & 0xFF for v in vals])
 
-    async def status(self):
-        s = (await self.read(0x02))[0]
-        return {"ok": s & 1, "ovf": (s >> 1) & 1, "run": (s >> 2) & 1, "level": s >> 4}
-
-    async def samples(self, k):
-        r = await self.read(0x10, 6 * k)
-        out = []
+    async def records(self, k):
+        r = await self.read(0x20, 10 * k)
+        recs = []
         for j in range(k):
-            b = r[6 * j:6 * j + 6]
-            out.append(tuple(to_s16(b[2 * i] | (b[2 * i + 1] << 8)) for i in range(3)))
+            v = int.from_bytes(bytes(r[10 * j:10 * j + 10]), "little")
+            axes = []
+            for a in range(3):
+                x = (v >> (16 + 20 * a)) & 0xFFFFF
+                axes.append(x - (1 << 20) if x >> 19 else x)
+            recs.append({"ts": v & 0xFFFF, "axes": tuple(axes),
+                         "src": (v >> 76) & 7, "gap": v >> 79})
+        return recs
+
+
+def reference(bus_log, mode=0, thr=7800, hyst=800, gain=(25600,) * 3,
+              offs=(0, 0, 0), perm_l=(0, 1, 2), perm_h=(0, 1, 2),
+              sign_l=(0, 0, 0), sign_h=(0, 0, 0)):
+    """Bit-exact replay of merge_dp.v. Returns [(axes, src, drdy_time_ns)]."""
+    def mapv(raw, perm, sign):
+        out = []
+        for k in range(3):
+            v = s16(raw[perm[k]])
+            if sign[k]:
+                v = 32767 if v == -32768 else -v
+            out.append(v)
         return out
 
+    l_hold, h_hold, st, recs = (0, 0, 0), (0, 0, 0), [0, 0, 0], []
+    for kind, raw, t in bus_log:
+        if kind == "L":
+            l_hold = raw
+            if mode != 1:
+                continue
+        else:
+            h_hold = raw
+            if mode == 1:
+                continue
+        lm, hm = mapv(l_hold, perm_l, sign_l), mapv(h_hold, perm_h, sign_h)
+        axes, src = [], 0
+        for k in range(3):
+            l14 = lm[k] >> 2
+            h12 = hm[k] >> 4
+            hs = ((h12 * gain[k]) >> 8) + offs[k]
+            hs = max(-524288, min(524287, hs))
+            a = abs(l14)
+            lo = thr - hyst if thr > hyst else 0
+            new = 1 if a >= thr else 0 if a < lo else st[k]
+            sel = 1 if mode == 2 else 0 if mode == 1 else new
+            if mode == 0:
+                st[k] = new
+            axes.append(hs if sel else l14)
+            src |= sel << k
+        recs.append((tuple(axes), src, t))
+    return recs
 
-def to_s16(v):
-    v &= 0xFFFF
-    return v - 0x10000 if v & 0x8000 else v
 
-
-def _wrap(v, w):
-    v &= (1 << w) - 1
-    return v - (1 << w) if v >> (w - 1) else v
-
-
-def cic_ref(xs, n=2, r_log2=0, rl=4):
-    """Bit-exact model of cic_decim.v for one axis."""
-    w = 16 + n * rl
-    r = 1 << r_log2
-    integ, dly, out, cnt = [0] * n, [0] * n, [], 0
-    for x in xs:
-        v = x
-        for k in range(n):
-            integ[k] = _wrap(integ[k] + v, w)
-            v = integ[k]
-        dec = cnt == r - 1
-        cnt = 0 if dec else cnt + 1
-        if dec:
-            for k in range(n):
-                new = _wrap(v - dly[k], w)
-                dly[k] = v
-                v = new
-            out.append(to_s16(v >> (n * r_log2)))
-    return out
+def shock(t_ns, t0_ns, peak_g, width_ns, rest=(0.0, 0.0, 1.0)):
+    """Half-sine shock on X on top of a resting 1 g on Z."""
+    x = rest[0]
+    if t0_ns <= t_ns <= t0_ns + width_ns:
+        x += peak_g * math.sin(math.pi * (t_ns - t0_ns) / width_ns)
+    return (x, rest[1] + 0.3 * math.sin(t_ns * 2e-6), rest[2])

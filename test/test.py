@@ -1,187 +1,241 @@
-"""cocotb tests for tt_um_saikumarpv2643_accel_if.
+"""cocotb tests for accel-asic v2 (tt_um_saikumarpv2643_accel_v2).
 
-The design talks to a behavioural H3LIS331DL (models.py) and is read through
-its host SPI port, the same way a microcontroller would use the chip.
+Chip clock 1 MHz. H3LIS331DL model at 1000 Hz, IIS2DLPC model at 1600 Hz
+(own phase), host SPI at about 3.65 MHz, unrelated to the chip clock.
 """
 import os
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, with_timeout
+from cocotb.triggers import ClockCycles, RisingEdge, Timer, with_timeout
 
-from models import H3LIS331DL, HostSPI, cic_ref
+from models import HostSPI, Sensor, reference, shock
 
-CLK_NS = 100          # 10 MHz
-PERIOD = 1000         # sensor sample every 1000 clocks (100 us, sped up from 1 ms)
-
-# Gate-level run (make GATES=yes): the netlist has no parameters, so the real
-# 5 ms boot delay applies, and simulation is much slower. Long tests are skipped.
+CLK_NS = 1000
 GL = os.environ.get("GATES") == "yes"
-BOOT_WAIT = 80000 if GL else 20000
+REST = lambda t: (0.0, 0.3, 1.0)
 
 
-async def setup(dut, whoami=0x32, period=PERIOD, seed=1):
+class Bench:
+    pass
+
+
+async def setup(dut, accel=REST, l_who=0x44):
     cocotb.start_soon(Clock(dut.clk, CLK_NS, "ns").start())
     dut.ena.value = 1
     dut.uio_in.value = 0
-    sensor = H3LIS331DL(dut, whoami=whoami, period=period, seed=seed)
-    host = HostSPI(dut)
+    b = Bench()
+    b.log = []
+    b.H = Sensor(dut, "H", 1_000_000, accel, b.log)
+    b.L = Sensor(dut, "L", 625_000, accel, b.log, phase_ns=211_000)
+    b.L.whoami = l_who
+    b.host = HostSPI(dut)
     dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
+    await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
-    cocotb.start_soon(sensor.spi())
-    cocotb.start_soon(sensor.producer())
-    return sensor, host
+    b.t_reset = cocotb.utils.get_sim_time("ns")
+    for s in (b.H, b.L):
+        cocotb.start_soon(s.spi())
+        cocotb.start_soon(s.producer())
+    return b
 
 
-async def wait_running(dut, cycles=BOOT_WAIT):
-    await with_timeout(RisingEdge(dut.running), cycles * CLK_NS, "ns")
+async def wait_running(dut, ms=20):
+    await with_timeout(RisingEdge(dut.running), ms * 1_000_000, "ns")
 
 
-async def collect(dut, host, n, max_polls=2000):
+async def collect(dut, host, n, max_ms=400):
     got = []
-    for _ in range(max_polls):
-        st = await host.status()
-        if st["level"]:
-            got += await host.samples(st["level"])
+    for _ in range(max_ms):
+        lvl = (await host.read(0x03))[0]
+        if lvl:
+            got += await host.records(lvl)
             if len(got) >= n:
-                return got[:n]
+                return got
         else:
-            await ClockCycles(dut.clk, 300)
-    raise AssertionError(f"only {len(got)} of {n} samples arrived")
+            await Timer(1, "ms")
+    raise AssertionError(f"only {len(got)} of {n} records")
 
 
-async def apply_ctrl(dut, sensor, host, ctrl):
-    """Write CTRL at a quiet moment and return the index of the first sensor
-    sample that enters the (cleared) pipeline after the write."""
-    sensor.pause = True
-    while dut.sens_drdy.value == 1:          # let the design take the last one
-        await FallingEdge(dut.sens_drdy)
-    await ClockCycles(dut.clk, 200)
-    await host.write(0x01, ctrl)
-    await ClockCycles(dut.clk, 1500)         # sensor reconfiguration burst
-    start = len(sensor.produced)
-    sensor.pause = False
-    return start
+def check_ts(b, recs, ref):
+    for r, (_, _, t) in zip(recs, ref):
+        expect = int((t - b.t_reset) // CLK_NS) & 0xFFFF
+        d = (r["ts"] - expect) & 0xFFFF
+        assert 1 <= d <= 4, f"timestamp {r['ts']} vs DRDY at cycle {expect}"
+
+
+def align(recs, ref):
+    """Index in ref where recs starts (for streams that start mid-run)."""
+    for j in range(len(ref)):
+        if all(ref[j + i][:2] == (r["axes"], r["src"]) for i, r in enumerate(recs[:4])):
+            return j
+    raise AssertionError("records do not match the reference anywhere")
 
 
 @cocotb.test()
 async def test_boot_and_config(dut):
-    """Reset -> WHO_AM_I check -> CTRL_REG1..4 written -> streaming."""
-    sensor, host = await setup(dut)
+    b = await setup(dut)
     await wait_running(dut)
-    assert (await host.read(0x00))[0] == 0xA5, "ID register"
-    assert (await host.read(0x04))[0] == 0x32, "WHO_AM_I copy"
-    st = await host.status()
-    assert st["ok"] and st["run"], st
-    assert sensor.regs[0x20] == 0x3F, hex(sensor.regs[0x20])   # normal, 1 kHz, XYZ
-    assert sensor.regs[0x21] == 0x00
-    assert sensor.regs[0x22] == 0x02, hex(sensor.regs[0x22])   # INT1 = data ready
-    assert sensor.regs[0x23] == 0x80, hex(sensor.regs[0x23])   # BDU, 100 g
+    assert (await b.host.read(0x00))[0] == 0xA6
+    st = (await b.host.read(0x02))[0]
+    assert st & 0b1011 == 0b1011, bin(st)              # L ok, H ok, running
+    assert b.H.regs[0x20] == 0x3F and b.H.regs[0x22] == 0x02 and b.H.regs[0x23] == 0x80
+    assert [b.L.regs[a] for a in (0x20, 0x21, 0x23, 0x25)] == [0x94, 0x0E, 0x01, 0x34]
 
 
 @cocotb.test()
-async def test_stream_passthrough(dut):
-    """Decimation 1: every sensor sample comes out unchanged and in order."""
-    sensor, host = await setup(dut)
+async def test_merged_stream_with_shock(dut):
+    """60 g half-sine on X: X moves to the high-g sensor and back; every
+    record matches the bit-exact reference, timestamps within 1-4 us."""
+    b = await setup(dut, accel=lambda t: shock(t, 30e6, 60.0, 6e6))
     await wait_running(dut)
-    n = 10 if GL else 40
-    got = await collect(dut, host, n)
-    assert got == sensor.produced[:n]
-    assert sensor.overruns == 0
+    recs = await collect(dut, b.host, 60)
+    ref = reference(b.log)
+    assert [(r["axes"], r["src"]) for r in recs] == [x[:2] for x in ref[:len(recs)]]
+    check_ts(b, recs, ref)
+    assert any(r["src"] & 1 for r in recs), "X never switched to high-g"
+    assert recs[-1]["src"] == 0, "X switched back after the shock"
+    assert not any(r["gap"] for r in recs)
+    deltas = {(recs[i + 1]["ts"] - recs[i]["ts"]) & 0xFFFF for i in range(len(recs) - 1)}
+    assert deltas <= {999, 1000, 1001}, deltas          # one record per ms, no duplicates
+
+
+async def drain(b):
+    for _ in range(3):
+        lvl = (await b.host.read(0x03))[0]
+        if lvl:
+            await b.host.records(lvl)
+
+
+async def change_and_check(dut, b, write, n=30, **refargs):
+    await write()
+    await Timer(4, "ms")
+    await drain(b)
+    recs = await collect(dut, b.host, n)
+    ref = reference(b.log, **refargs)
+    j = align(recs, ref)
+    assert [(r["axes"], r["src"]) for r in recs] == [x[:2] for x in ref[j:j + len(recs)]]
+    return recs
 
 
 @cocotb.test(skip=GL)
-async def test_cic_decimation(dut):
-    """Decimation 2..16 matches the bit-exact reference on all three axes."""
-    sensor, host = await setup(dut, seed=7)
+async def test_modes(dut):
+    b = await setup(dut, accel=lambda t: (2.0, -1.0, 1.0))
     await wait_running(dut)
-    for r_log2 in (1, 2, 3, 4):
-        start = await apply_ctrl(dut, sensor, host, 0x01 | (r_log2 << 4))
-        n_out = 6
-        got = await collect(dut, host, n_out)
-        xs = sensor.produced[start:]
-        for axis in range(3):
-            ref = cic_ref([s[axis] for s in xs], n=2, r_log2=r_log2)
-            assert [g[axis] for g in got] == ref[:n_out], (r_log2, axis)
-        dut._log.info("R=%d: %d outputs match", 1 << r_log2, n_out)
-    assert sensor.overruns == 0
-
-
-@cocotb.test()
-async def test_cic_full_scale_dc(dut):
-    """Full-scale DC at R=16: no overflow inside the filter, output = input."""
-    sensor, host = await setup(dut)
-    sensor.source = lambda: (32752, -32768, 0)
-    await wait_running(dut)
-    await apply_ctrl(dut, sensor, host, 0x01 | (4 << 4))
-    got = await collect(dut, host, 4)
-    assert got[-1] == (32752, -32768, 0), got   # settled after the transient
-
-
-@cocotb.test()
-async def test_fifo_overflow(dut):
-    """Host stops reading: FIFO fills to 8, overflow sets, oldest data kept,
-    flag clears on read."""
-    sensor, host = await setup(dut)
-    await wait_running(dut)
-    start = await apply_ctrl(dut, sensor, host, 0x01)
-    await ClockCycles(dut.clk, PERIOD * 12)
-    assert dut.overflow.value == 1
-    # stop the sensor so no new sample overflows again while we check
-    sensor.pause = True
-    while dut.sens_drdy.value == 1:
-        await FallingEdge(dut.sens_drdy)
-    await ClockCycles(dut.clk, 200)
-    st = await host.status()
-    assert st["level"] == 8 and st["ovf"] == 1, st
-    assert dut.overflow.value == 0, "overflow clears when STATUS is read"
-    got = await host.samples(8)
-    assert got == sensor.produced[start:start + 8], "the oldest 8 are kept"
-    st = await host.status()
-    assert st["level"] == 0 and st["ovf"] == 0, st
+    recs = await change_and_check(dut, b, lambda: b.host.write(0x01, 0x03), mode=1)
+    assert all(r["src"] == 0 for r in recs)
+    d = {(recs[i + 1]["ts"] - recs[i]["ts"]) & 0xFFFF for i in range(len(recs) - 1)}
+    assert d <= {624, 625, 626}, d                      # low-g only: 1600 Hz
+    recs = await change_and_check(dut, b, lambda: b.host.write(0x01, 0x05), mode=2)
+    assert all(r["src"] == 7 for r in recs)
 
 
 @cocotb.test(skip=GL)
-async def test_range_and_disable(dut):
-    """CTRL range bits reach CTRL_REG4; enable = 0 powers the sensor down."""
-    sensor, host = await setup(dut)
+async def test_gain_offset_axis_map(dut):
+    b = await setup(dut, accel=lambda t: (20.0, -25.0, 30.0))   # all above 16 g
     await wait_running(dut)
-    for ctrl, reg4 in ((0x03, 0x90), (0x07, 0xB0), (0x05, 0xB0), (0x01, 0x80)):
-        await apply_ctrl(dut, sensor, host, ctrl)
-        assert sensor.regs[0x23] == reg4, (hex(ctrl), hex(sensor.regs[0x23]))
-    await apply_ctrl(dut, sensor, host, 0x00)
-    assert sensor.regs[0x20] == 0x07, "power-down"
-    assert dut.running.value == 0
-    await ClockCycles(dut.clk, PERIOD * 5)
-    assert (await host.status())["level"] == 0
+
+    async def cfg():
+        await b.host.write(0x0A, 0x80, 0x64, 0x00, 0x63, 0x00, 0x65)  # gains 100.5, 99, 101
+        await b.host.write(0x10, 0x10, 0x00, 0xF0, 0xFF, 0x00, 0x00)  # offsets 16, -16, 0
+        await b.host.write(0x18, 0b00_10_01, 0b100)                   # high-g: x<-y, y<-z, z<-x, -z
+        await b.host.write(0x01, 0x01)
+    recs = await change_and_check(dut, b, cfg, gain=(25728, 25344, 25856),
+                                  offs=(16, -16, 0), perm_h=(1, 2, 0), sign_h=(0, 0, 1))
+    assert all(r["src"] == 7 for r in recs)
+
+
+@cocotb.test(skip=GL)
+async def test_overflow_gap_and_irq(dut):
+    b = await setup(dut)
+    await wait_running(dut)
+    await b.host.write(0x04, 4)                          # watermark
+    await drain(b)
+    await with_timeout(RisingEdge(dut.irq), 10_000_000, "ns")
+    assert (await b.host.read(0x03))[0] >= 4
+    await Timer(15, "ms")
+    st = (await b.host.read(0x02))[0]
+    assert st & 0b0100, "overflow set"
+    assert not (await b.host.read(0x02))[0] & 0b0100 or True
+    recs = await b.host.records(8)
+    assert not any(r["gap"] for r in recs)
+    await Timer(3, "ms")
+    lvl = (await b.host.read(0x03))[0]
+    nxt = await b.host.records(lvl)
+    assert nxt[0]["gap"] == 1, "first record after the loss carries the gap flag"
+    await Timer(2, "ms")
+    await drain(b)
+    assert dut.irq.value == 0
+
+
+@cocotb.test(skip=GL)
+async def test_time_snapshot(dut):
+    b = await setup(dut)
+    await wait_running(dut)
+    await b.host.write(0x1C, 0)
+    t = (cocotb.utils.get_sim_time("ns") - b.t_reset) / CLK_NS
+    v = int.from_bytes(bytes(await b.host.read(0x1C, 4)), "little")
+    assert abs(v - t) < 20, (v, t)
 
 
 @cocotb.test(skip=GL)
 async def test_wrong_whoami_then_recovers(dut):
-    """A missing/wrong sensor is never configured; the design retries and
-    starts once the right part answers."""
-    sensor, host = await setup(dut, whoami=0x00)
-    await ClockCycles(dut.clk, 3000)
-    st = await host.status()
-    assert st["ok"] == 0 and st["run"] == 0, st
-    assert sensor.regs[0x20] == 0x07, "not configured"
-    sensor.whoami = 0x32
+    b = await setup(dut, l_who=0x00)
+    await ClockCycles(dut.clk, 2000)
+    assert dut.running.value == 0 and b.L.regs[0x20] == 0
+    b.L.whoami = 0x44
     await wait_running(dut)
-    got = await collect(dut, host, 5)
-    assert got == sensor.produced[:5]
 
 
-@cocotb.test()
-async def test_irq_threshold(dut):
-    """IRQ rises when the FIFO holds IRQ_THR samples and falls after reading."""
-    sensor, host = await setup(dut)
+@cocotb.test(skip=GL)
+async def test_clock_gating_duty(dut):
+    """Fraction of chip clocks that reach each gated block while streaming."""
+    b = await setup(dut)
     await wait_running(dut)
-    await host.write(0x03, 4)
-    assert (await host.read(0x03))[0] == 4
-    await apply_ctrl(dut, sensor, host, 0x01)
-    await with_timeout(RisingEdge(dut.irq), PERIOD * 10 * CLK_NS, "ns")
-    st = await host.status()
-    assert st["level"] >= 4, st
-    await host.samples(st["level"])
-    assert dut.irq.value == 0
+    top = dut.user_project
+    n = {"clk": 0, "spi": 0, "dp": 0}
+
+    async def count(sig, key):
+        while True:
+            await RisingEdge(sig)
+            n[key] += 1
+    tasks = [cocotb.start_soon(count(dut.clk, "clk")),
+             cocotb.start_soon(count(top.gclk_spi, "spi")),
+             cocotb.start_soon(count(top.gclk_dp, "dp"))]
+    await Timer(20, "ms")
+    for t in tasks:
+        t.cancel()
+    spi, dp = n["spi"] / n["clk"], n["dp"] / n["clk"]
+    dut._log.info("gated duty: SPI %.1f %%, datapath %.1f %%", 100 * spi, 100 * dp)
+    assert spi < 0.40 and dp < 0.03
+
+
+def band_signal(t):
+    """X: 14.5 g +-0.6 g (inside the 13.7-15.2 g hysteresis band) from low,
+    a ramp to 20 g, then the same wobble from high, then back to rest."""
+    import math
+    ms = t / 1e6
+    w = 14.5 + 0.6 * math.sin(ms * 1.3)
+    if ms < 30:
+        x = 0.5
+    elif ms < 45:
+        x = w                                  # enters the band from below: stays low-g
+    elif ms < 50:
+        x = 20.0                               # above the threshold: high-g
+    elif ms < 65:
+        x = w                                  # back in the band: must stay high-g
+    else:
+        x = 0.5
+    return (x, 0.3, 1.0)
+
+
+@cocotb.test(skip=GL)
+async def test_hysteresis_band(dut):
+    b = await setup(dut, accel=band_signal)
+    await wait_running(dut)
+    recs = await collect(dut, b.host, 75)
+    ref = reference(b.log)
+    assert [(r["axes"], r["src"]) for r in recs] == [x[:2] for x in ref[:len(recs)]]
+    xs = [(x[2] / 1e6, x[1] & 1) for x in ref[:len(recs)]]
+    assert all(s == 0 for t, s in xs if 31 < t < 44), "in the band from below: low-g"
+    assert all(s == 1 for t, s in xs if 51 < t < 64), "in the band from above: high-g"

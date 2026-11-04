@@ -1,45 +1,46 @@
 # Tiny Tapeout project information (yaml_version 6, from ttsky-verilog-template)
 project:
-  title:        "Accelerometer Interface (H3LIS331DL)"
+  title:        "Low-Power Dual-Sensor Accelerometer Front-End"
   author:       "Sai Kumar Poludasu"
   discord:      ""
-  description:  "SPI master for an H3LIS331DL accelerometer, CIC decimator, FIFO and SPI slave host port"
+  description:  "Reads a +/-16 g and a +/-400 g accelerometer, merges them into one timestamped stream, and buffers it for a sleeping host"
   language:     "Verilog"
-  clock_hz:     10000000
+  clock_hz:     1000000
 
-  # Estimate from generic synthesis (983 flip-flops). Confirm with the GDS
-  # hardening run before submitting; 1x2 may fit with an 4-deep FIFO.
-  tiles: "2x2"
+  # First-run estimate: 6557 generic cells at about 1000 gates per tile.
+  # Shrink or grow it from the utilization the GDS run reports.
+  tiles: "6x2"
 
-  top_module:  "tt_um_saikumarpv2643_accel_if"
+  top_module:  "tt_um_saikumarpv2643_accel_v2"
 
   source_files:
     - "project.v"
+    - "clk_gate.v"
     - "spi_master.v"
-    - "sensor_ctrl.v"
-    - "cic_decim.v"
-    - "sync_fifo.v"
-    - "host_if.v"
+    - "sensor_seq.v"
+    - "merge_dp.v"
+    - "async_fifo.v"
+    - "host_spi.v"
 
 pinout:
   # Inputs
-  ui[0]: "SENS_MISO"
-  ui[1]: "SENS_DRDY"
-  ui[2]: "HOST_SCK"
-  ui[3]: "HOST_MOSI"
-  ui[4]: "HOST_CS_N"
-  ui[5]: ""
+  ui[0]: "S_MISO"
+  ui[1]: "DRDY_L"
+  ui[2]: "DRDY_H"
+  ui[3]: "HOST_SCK"
+  ui[4]: "HOST_MOSI"
+  ui[5]: "HOST_CS_N"
   ui[6]: ""
   ui[7]: ""
 
   # Outputs
-  uo[0]: "SENS_SCK"
-  uo[1]: "SENS_MOSI"
-  uo[2]: "SENS_CS_N"
-  uo[3]: "HOST_MISO"
-  uo[4]: "IRQ"
-  uo[5]: "SENSOR_OK"
-  uo[6]: "OVERFLOW"
+  uo[0]: "S_SCK"
+  uo[1]: "S_MOSI"
+  uo[2]: "CS_L_N"
+  uo[3]: "CS_H_N"
+  uo[4]: "HOST_MISO"
+  uo[5]: "IRQ"
+  uo[6]: "SAT"
   uo[7]: "RUNNING"
 
   # Bidirectional pins
